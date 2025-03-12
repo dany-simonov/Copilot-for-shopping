@@ -46,12 +46,12 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Провайдеры
 PRIMARY_PROVIDERS = [
     g4f.Provider.TeachAnything,
-    g4f.Provider.GizAI
+    g4f.Provider.ChatGLM,
+    g4f.Provider.Free2GPT
 ]
 
 BACKUP_PROVIDERS = [
-    g4f.Provider.Free2GPT,
-    g4f.Provider.ChatGLM
+    g4f.Provider.GizAI
 ]
 
 # Состояния пользователя
@@ -99,6 +99,25 @@ def get_shoe_size_keyboard(gender):
             ["39", "40", "41", "42", "43", "Другой размер"]
     keyboard.add(*[types.KeyboardButton(size) for size in sizes])
     return keyboard
+
+@bot.message_handler(func=lambda message: message.text in ["🔄 Найти новые вещи", "⏩ Показать еще"])
+def handle_recommendation_buttons(message):
+    user_id = message.from_user.id
+    
+    if message.text == "🔄 Найти новые вещи":
+        start_dialog(message)
+    else:  # "⏩ Показать еще"
+        if user_id in user_answers:
+            current_offset = user_states.get(f"{user_id}_offset", 0) + 3
+            user_states[f"{user_id}_offset"] = current_offset
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(
+                generate_recommendations(message, user_answers[user_id], offset=current_offset)
+            )
+            loop.close()
+
 
 # Обработчики сообщений
 @bot.message_handler(commands=['start'])
@@ -197,27 +216,61 @@ def handle_message(message):
         loop.run_until_complete(generate_recommendations(message, user_answers[user_id]))
         loop.close()
 
-async def generate_recommendations(message, answers):
+
+async def get_similar_colors(color: str) -> list:
+    prompt = f"""
+    Напиши 3-4 оттенка или похожих цвета для цвета "{color}".
+    Важно:
+    - Только названия цветов
+    - Каждый цвет с новой строки с цифрой
+    - Без пояснений и описаний
+    Пример:
+    1. бежевый
+    2. кремовый
+    3. песочный
+    """
+    
+    response = await get_best_response(prompt)
+    colors = []
+    for line in response.split('\n'):
+        if line.strip() and line[0].isdigit():
+            color_name = line.split('.')[1].strip().lower()
+            colors.append(color_name)
+    
+    return [color.lower()] + colors
+
+
+async def generate_recommendations(message, answers, offset=0):
     print("\n=== Начало генерации рекомендаций ===")
     print(f"Данные пользователя: {answers}")
     
     prompt = f"""
-    Ты - профессиональный стилист. Создай рекомендации для клиента:
+    Ты - профессиональный стилист:
     Пол: {answers['gender']}
     {'Мероприятие: ' + answers['event_description'] if 'event_description' in answers else 'Пожелания: ' + answers['clothes_description']}
     Тип одежды: {answers['clothes_type']}
     Размер одежды: {answers['size']}
     Цвета: {answers['color']}
     Особые пожелания: {answers['wishes']}
+    Напиши список из 2-3 конкретных предметов одежды для поиска в интернет-магазине. Важно:  
+
+   - Используй простые и четкие названия товаров  
+   - Не используй скобки и сложные описания  
+   - Пиши каждый товар с новой строки, начиная с цифры  
+   - Не добавляй лишних комментариев и пояснений 
+   - Не пиши поняла или что-то вроде этого
+   
+    Пример правильного ответа:  
     
-    Напиши список из 2-3 конкретных предметов одежды для поиска в интернет-магазине. Важно:
-    - Используй простые и четкие названия товаров
-    - Пиши каждый товар с новой строки, начиная с цифры
-    - Не используй сложные описания
+    1. Черный костюм  
+    2. Белая рубашка  
+    3. Черные туфли  
+    и так далее  
     """
 
-    # Получаем прямую ссылку из нашей структуры категорий
-    search_url = CATEGORIES[answers['gender']]['Верхняя одежда']
+
+    search_url = CATEGORIES[answers['gender']][answers['clothes_type']]
+    color_variants = await get_similar_colors(answers['color'].lower())
     
     items_to_search = await get_best_response(prompt)
     print(f"\nОтвет нейросети:\n{items_to_search}")
@@ -225,77 +278,36 @@ async def generate_recommendations(message, answers):
     try:
         products = parser(url=search_url, low_price=1000, top_price=50000, discount=0)
         if products:
-            for product in products[:3]:
-                recommendation = await format_recommendation(product)
-                bot.send_message(message.chat.id, recommendation)
+            filtered_products = [
+                p for p in products
+                if any(color in p['name'].lower() for color in color_variants)
+                and float(p['rating'].replace(',', '.')) >= 4.0
+            ]
+            
+            if filtered_products:
+                current_products = filtered_products[offset:offset+3]
                 
+                for product in current_products:
+                    recommendation = await format_recommendation(product)
+                    bot.send_message(message.chat.id, recommendation)
+                    
+                    # Добавляем краткую информацию
+                    rating = float(product['rating'].replace(',', '.'))
+                    text = f"🛍️ Краткая информация:\n"
+                    text += f"💰 Цена: {product['salePriceU']} руб.\n"
+                    text += f"⭐ Рейтинг: {rating:.1f}\n"
+                    text += f"🔗 Быстрая ссылка: {product['link']}"
+                    bot.send_message(message.chat.id, text)
+                
+                keyboard = get_after_recommendations_keyboard()
+                bot.send_message(message.chat.id, "Показать что-то еще?", reply_markup=keyboard)
+            else:
+                bot.send_message(message.chat.id, "К сожалению, не нашлось подходящих товаров. Попробуйте другой цвет или категорию.")
+               
     except Exception as e:
         print(f"Ошибка поиска: {e}")
+        bot.send_message(message.chat.id, "Произошла ошибка при поиске. Попробуйте еще раз.")
 
-
-# async def generate_recommendations(message, answers):
-#     print("\n=== Начало генерации рекомендаций ===")
-#     print(f"Данные пользователя: {answers}")
-    
-#     catalogs_wb = get_catalogs_wb()
-    
-#     prompt = f"""
-#     Ты - профессиональный стилист. Создай рекомендации для клиента:
-#     Пол: {answers['gender']}
-#     {'Мероприятие: ' + answers['event_description'] if 'event_description' in answers else 'Пожелания: ' + answers['clothes_description']}
-#     Тип одежды: {answers['clothes_type']}
-#     Размер одежды: {answers['size']}
-#     Цвета: {answers['color']}
-#     Особые пожелания: {answers['wishes']}
-    
-#        Напиши список из 2-3 конкретных предметов одежды для поиска в интернет-магазине. Важно:  
-
-#    - Используй простые и четкие названия товаров  
-#    - Не используй скобки и сложные описания  
-#    - Пиши каждый товар с новой строки, начиная с цифры  
-#    - Не добавляй лишних комментариев и пояснений  
-   
-#     Пример правильного ответа:  
-#     1. Черный костюм  
-#     2. Белая рубашка  
-#     3. Черные туфли  
-#     и так далее  
-#     """
-    
-#     items_to_search = await get_best_response(prompt)
-#     print(f"\nОтвет нейросети:\n{items_to_search}")
-    
-#     search_results = []
-#     catalog_data = get_data_category(catalogs_wb)
-    
-#     for item in items_to_search.split('\n'):
-#         if not item.strip() or not item[0].isdigit():
-#             continue
-        
-#         item = item.split('.')[1].strip()
-#         print(f"\nПоиск товара: {item}")
-        
-#         for category in catalog_data:
-#             try:
-#                 # Получаем первые 300 товаров
-#                 products = parser(
-#                     url=category['url'], 
-#                     low_price=1000, 
-#                     top_price=50000, 
-#                     discount=0,
-#                     limit=300  # Ограничиваем выборку
-#                 )
-                
-#                 if products:
-#                     filtered_products = [p for p in products if item.lower() in p['name'].lower()]
-#                     if filtered_products:
-#                         search_results.append({
-#                             'item': item,
-#                             'products': filtered_products[:3]
-#                         })
-#                         break  # Прерываем поиск если нашли подходящие товары
-#             except Exception as e:
-#                 continue
 
 
 async def generate_ai_description(name, brand, rating, price):
@@ -378,6 +390,14 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+def get_after_recommendations_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    keyboard.add(
+        types.KeyboardButton("🔄 Найти новые вещи"),
+        types.KeyboardButton("⏩ Показать еще")
+    )
+    return keyboard
 
 @bot.message_handler(commands=['restart'])
 def restart(message):
